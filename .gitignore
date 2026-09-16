@@ -18,3 +18,66 @@ __pycache__/
 
 # Streamlit
 .streamlit/
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# JavaScript / frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.next/
+out/
+coverage/
+
+# RAG data, uploads, indexes, and local databases
+data/
+datasets/
+documents/
+uploads/
+chroma/
+chroma_db/
+vectorstore/
+vector_store/
+*.faiss
+*.index
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs and runtime files
+*.log
+logs/
+tmp/
+temp/
+*.pid
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local Docker overrides
+docker-compose.override.yml

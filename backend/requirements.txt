@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+sentence-transformers
+numpy
+anthropic
+python-dotenv
+psycopg2-binary
+pypdf
+supabase
+pytest
