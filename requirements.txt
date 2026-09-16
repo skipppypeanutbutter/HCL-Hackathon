@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+langchain
+langchain-openai
+langchain-community
+langchain-core
+langchain-classic
+sentence-transformers
+langchain-huggingface
+psycopg2-binary
+pgvector
+pandas
+python-dotenv
+streamlit
+requests
