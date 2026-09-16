@@ -4,6 +4,7 @@ langchain
 langchain-openai
 langchain-community
 langchain-core
+langchain-classic
 langchain-huggingface
 faiss-cpu
 sentence-transformers
