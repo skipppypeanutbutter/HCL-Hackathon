@@ -1,0 +1,104 @@
+"""
+Tools available to the RAG agent.
+
+This is the "single agent, multiple tools" pattern discussed in the plan:
+the LLM decides which tool a question needs, instead of a hardcoded
+if/else branch. The grounding + abstention rule lives in the agent's
+system prompt (agent.py), not here - these tools just return raw data
+(or "NO_RESULTS") and let the model decide what that means.
+
+- retrieve_documents: semantic search over unstructured docs (fund fact
+  sheets, policy, call notes, correspondence) - built from Person A/B's
+  ingestion + vector store work.
+- lookup_client_portfolio / lookup_client_transactions: exact structured
+  lookups against the client CSV/JSON, for when semantic search over
+  chunked text is the wrong tool (you want one exact record, not a
+  similarity match).
+"""
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+from langchain_core.tools import tool
+
+from retrieval.vectorstore import get_retriever
+
+CLIENTS_PATH = Path(os.getenv("CLIENTS_PATH", "data/clients_portfolio.json"))
+TRANSACTIONS_PATH = Path(os.getenv("TRANSACTIONS_PATH", "data/transactions.csv"))
+
+_clients_df = None
+_transactions_df = None
+
+
+def _load_clients() -> pd.DataFrame:
+    global _clients_df
+    if _clients_df is None:
+        with open(CLIENTS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        _clients_df = pd.json_normalize(raw)
+    return _clients_df
+
+
+def _load_transactions() -> pd.DataFrame:
+    global _transactions_df
+    if _transactions_df is None:
+        _transactions_df = pd.read_csv(TRANSACTIONS_PATH)
+    return _transactions_df
+
+
+@tool
+def retrieve_documents(query: str) -> str:
+    """
+    Search fund fact sheets, policy documents, RM call notes, and client
+    correspondence for passages relevant to the query. Returns the top
+    matching passages with their source filenames so the answer can cite
+    them. Use this for product, policy, or general (non-client-specific)
+    questions.
+    """
+    retriever = get_retriever(k=5)
+    results = retriever.invoke(query)
+    if not results:
+        return "NO_RESULTS: nothing relevant was found in the document store."
+
+    formatted = []
+    for i, doc in enumerate(results, 1):
+        source = doc.metadata.get("source", "unknown")
+        doc_type = doc.metadata.get("doc_type", "")
+        formatted.append(f"[{i}] (source: {source}, type: {doc_type})\n{doc.page_content}")
+    return "\n\n".join(formatted)
+
+
+@tool
+def lookup_client_portfolio(client_id: str) -> str:
+    """
+    Look up one client's exact record - holdings, risk profile, and KYC
+    attributes - by client_id. Use this instead of retrieve_documents
+    whenever the question is about a SPECIFIC client's data: it reads the
+    structured client record directly rather than searching text.
+    """
+    df = _load_clients()
+    id_col = "client_id" if "client_id" in df.columns else df.columns[0]
+    match = df[df[id_col].astype(str) == str(client_id)]
+    if match.empty:
+        return f"NO_RESULTS: no client found with id '{client_id}'."
+    return match.to_json(orient="records", indent=2)
+
+
+@tool
+def lookup_client_transactions(client_id: str, limit: int = 10) -> str:
+    """
+    Look up a specific client's recent transactions (subscriptions,
+    redemptions, coupons) by client_id. Use alongside
+    lookup_client_portfolio when the question is about recent activity
+    rather than current holdings.
+    """
+    df = _load_transactions()
+    id_col = "client_id" if "client_id" in df.columns else df.columns[0]
+    match = df[df[id_col].astype(str) == str(client_id)].tail(limit)
+    if match.empty:
+        return f"NO_RESULTS: no transactions found for client '{client_id}'."
+    return match.to_json(orient="records", indent=2)
+
+
+TOOLS = [retrieve_documents, lookup_client_portfolio, lookup_client_transactions]
