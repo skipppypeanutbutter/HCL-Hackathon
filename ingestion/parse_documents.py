@@ -97,14 +97,16 @@ def ingest_pdf(path: Path, doc_type: str):
 
 def ingest_email_threads(path: Path):
     with open(path) as f:
-        threads = json.load(f)
+        data = json.load(f)
 
-    for thread in threads:
-        # TODO confirm these keys against the real client_correspondence.json
+    # Top-level file is {"dataset_note": ..., "email_threads": [...]}, not a
+    # bare list.
+    for thread in data["email_threads"]:
         subject = thread.get("subject", "untitled thread")
         messages = thread.get("messages", [])
+        # Real message keys are "from", "date", "body" (no "text" key).
         combined_text = "\n\n".join(
-            f"From: {m.get('from')}\nDate: {m.get('date')}\n{m.get('body', m.get('text', ''))}"
+            f"From: {m.get('from')}\nDate: {m.get('date')}\n{m.get('body', '')}"
             for m in messages
         )
         insert_document(
@@ -112,6 +114,11 @@ def ingest_email_threads(path: Path):
             title=subject,
             source_path=f"client_correspondence.json#{subject}",
             text=combined_text,
+            # NOTE: there's no "type" key on a thread, so this was always
+            # None - left as-is since it's outside the requested key list.
+            # Threads do carry "related_client_id" instead, which duplicates
+            # find_related_clients()'s regex extraction from the body text -
+            # flag if you want it captured here too.
             extra_metadata={"thread_type": thread.get("type")},
         )
 
