@@ -44,6 +44,22 @@ and `query_client_database` (agent-written SQL, `rag/sql_store.py`) → answer
 + intermediate steps returned to the frontend, shown in a "retrieval / tool
 trace" expander.
 
+## Evaluation
+
+`backend/eval/run_golden_qa.py` is set up to evaluate the agent against a
+golden question-answer set: for each question it runs the agent, checks
+whether the tool calls actually touched the expected source
+documents/tables (retrieval recall), and prints the agent's answer next to
+the expected answer for a human to compare (free-text correctness isn't
+auto-graded — a quick eyeball is faster and more trustworthy than a shaky
+grader on hackathon timelines).
+Run it with:
+```bash
+python -m eval.run_golden_qa
+```
+Results (per-question answers, sources touched vs. required, retrieval
+recall) get written to `eval/results.json`.
+
 ## Prerequisites
 
 - Python 3.10+
@@ -129,8 +145,7 @@ talking over HTTP, plus a managed Supabase database — nothing here needs a
 persistent local filesystem, so any container host works.
 
 **Backend (FastAPI)**
-- Any container platform (Render, Railway, Fly.io, an EC2/Cloud Run box)
-  works. Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
+- Any container platform works. Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
 - Set `SUPABASE_DB_URL` and `OPENAI_API_KEY` as environment variables/secrets
   on the host — never commit `.env`.
 - Update the CORS `allow_origins` in `app/main.py` (currently hardcoded to
@@ -152,26 +167,6 @@ shell script that backgrounds uvicorn and foregrounds streamlit) also
 works if you'd rather have one deployable unit — not set up in this repo
 yet.
 
-## Known issues
-
-A few things worth fixing before a demo or handoff:
-
-- **`app/main.py`'s docstring says `uvicorn app.backend.main:app`** — that
-  path doesn't exist; the file is at `app/main.py`, so the real command is
-  `uvicorn app.main:app --reload --port 8000` (used above). Stale comment,
-  harmless once you know the fix.
-- **Ingestion scripts point at the wrong `data/`.** `backend/ingestion/parse_structured.py`
-  and `parse_documents.py` both resolve `DATA_DIR = Path("data")` relative
-  to wherever they're run from. They're meant to be run from inside
-  `backend/` (`python -m ingestion.parse_structured`), which would look for
-  `backend/data/` — but the actual source files now live at the project
-  root's `data/`. Either move/copy `data/` into `backend/data/` before
-  running them, or update `DATA_DIR` in both scripts to
-  `Path(__file__).parent.parent.parent / "data"`.
-- **Two agents, one repo.** `backend/agent/` (Anthropic) and `rag/agent.py`
-  (LangChain + OpenAI) both exist and aren't connected to each other.
-  Confirm with your teammate which one is canonical and remove the other
-  before submission — having both is confusing for whoever reviews this.
 
 ## Tests
 
