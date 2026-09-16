@@ -10,7 +10,8 @@ ingestion scripts and the agent's sql_query tool need, and pgvector's
 import os
 import psycopg2
 import psycopg2.extras
-
+from dotenv import load_dotenv
+load_dotenv()
 
 def get_connection():
     db_url = os.environ["SUPABASE_DB_URL"]

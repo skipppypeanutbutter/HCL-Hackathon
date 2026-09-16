@@ -18,7 +18,7 @@ from pathlib import Path
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-from db.connection import run_write, run_write_many
+from db.connection import run_write, run_write_many, run_query
 
 DATA_DIR = Path("data")
 CLIENT_ID_PATTERN = re.compile(r"\bCL\d{3}\b")
@@ -26,8 +26,22 @@ CLIENT_ID_PATTERN = re.compile(r"\bCL\d{3}\b")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-def find_related_clients(text: str) -> list[str]:
-    return sorted(set(CLIENT_ID_PATTERN.findall(text)))
+def load_client_name_map() -> dict[str, str]:
+    """Maps client name -> client_id, so documents that mention a
+    client by name (most correspondence does) still get tagged.
+    Requires parse_structured.py to have run first.
+    """
+    rows = run_query("select client_id, name from clients where name is not null")
+    return {row["name"]: row["client_id"] for row in rows}
+
+
+def find_related_clients(text: str, client_names: dict[str, str]) -> list[str]:
+    found = set(CLIENT_ID_PATTERN.findall(text))
+    lowered = text.lower()
+    for name, client_id in client_names.items():
+        if name.lower() in lowered:
+            found.add(client_id)
+    return sorted(found)
 
 
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
@@ -43,8 +57,8 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]
     return chunks
 
 
-def insert_document(doc_type: str, title: str, source_path: str, text: str, extra_metadata: dict | None = None):
-    related_clients = find_related_clients(text)
+def insert_document(doc_type: str, title: str, source_path: str, text: str, client_names: dict[str, str], extra_metadata: dict | None = None):
+    related_clients = find_related_clients(text, client_names)
     metadata = {"related_clients": related_clients, **(extra_metadata or {})}
 
     rows = run_write_and_return_id(
@@ -89,24 +103,22 @@ def run_write_and_return_id(sql: str, params: tuple) -> list[dict]:
     return result
 
 
-def ingest_pdf(path: Path, doc_type: str):
+def ingest_pdf(path: Path, doc_type: str, client_names: dict[str, str]):
     reader = PdfReader(path)
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    insert_document(doc_type=doc_type, title=path.stem, source_path=path.name, text=text)
+    insert_document(doc_type=doc_type, title=path.stem, source_path=path.name, text=text, client_names=client_names)
 
 
-def ingest_email_threads(path: Path):
+def ingest_email_threads(path: Path, client_names: dict[str, str]):
     with open(path) as f:
-        data = json.load(f)
+        threads = json.load(f)
 
-    # Top-level file is {"dataset_note": ..., "email_threads": [...]}, not a
-    # bare list.
-    for thread in data["email_threads"]:
+    for thread in threads:
+        # TODO confirm these keys against the real client_correspondence.json
         subject = thread.get("subject", "untitled thread")
         messages = thread.get("messages", [])
-        # Real message keys are "from", "date", "body" (no "text" key).
         combined_text = "\n\n".join(
-            f"From: {m.get('from')}\nDate: {m.get('date')}\n{m.get('body', '')}"
+            f"From: {m.get('from')}\nDate: {m.get('date')}\n{m.get('body', m.get('text', ''))}"
             for m in messages
         )
         insert_document(
@@ -114,11 +126,7 @@ def ingest_email_threads(path: Path):
             title=subject,
             source_path=f"client_correspondence.json#{subject}",
             text=combined_text,
-            # NOTE: there's no "type" key on a thread, so this was always
-            # None - left as-is since it's outside the requested key list.
-            # Threads do carry "related_client_id" instead, which duplicates
-            # find_related_clients()'s regex extraction from the body text -
-            # flag if you want it captured here too.
+            client_names=client_names,
             extra_metadata={"thread_type": thread.get("type")},
         )
 
@@ -142,13 +150,16 @@ if __name__ == "__main__":
         "complex_product_risk_acknowledgement_forms.pdf": "form",
     }
 
+    client_names = load_client_name_map()
+    print(f"Loaded {len(client_names)} client names for tagging")
+
     print("Ingesting PDFs...")
     for filename, doc_type in pdf_files.items():
         path = DATA_DIR / filename
         if path.exists():
-            ingest_pdf(path, doc_type)
+            ingest_pdf(path, doc_type, client_names)
         else:
             print(f"  skipped {filename}, not found in {DATA_DIR}")
 
     print("Ingesting email threads...")
-    ingest_email_threads(DATA_DIR / "client_correspondence.json")
+    ingest_email_threads(DATA_DIR / "client_correspondence.json", client_names)
