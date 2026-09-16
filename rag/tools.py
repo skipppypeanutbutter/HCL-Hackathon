@@ -50,11 +50,22 @@ def retrieve_documents(query: str) -> str:
     if not results:
         return "NO_RESULTS: nothing relevant was found in the document store."
 
+    # Citation tag is tied to the actual chunk (source + chunk_index), NOT
+    # a per-call counter like [1], [2]. The agent calls retrieve_documents
+    # more than once per turn (it did twice in your last log), and a
+    # counter that resets to [1] every call means two DIFFERENT passages
+    # both end up labeled "[1]" - the model then has no way to cite them
+    # unambiguously, and rag/citations.py's extraction would silently
+    # collide/overwrite one with the other. A tag built from the chunk's
+    # own identity is stable and unique no matter how many times or in
+    # what order the tool gets called.
     formatted = []
-    for i, doc in enumerate(results, 1):
+    for doc in results:
         source = doc.metadata.get("source", "unknown")
         doc_type = doc.metadata.get("doc_type", "")
-        formatted.append(f"[{i}] (source: {source}, type: {doc_type})\n{doc.page_content}")
+        chunk_index = doc.metadata.get("chunk_index")
+        tag = f"{source}#p{chunk_index}" if chunk_index is not None else source
+        formatted.append(f"[{tag}] (source: {source}, type: {doc_type})\n{doc.page_content}")
     return "\n\n".join(formatted)
 
 

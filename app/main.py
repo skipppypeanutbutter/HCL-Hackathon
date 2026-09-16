@@ -5,7 +5,7 @@ Equivalent to your Django views.py + urls.py, but as a standalone API
 service that the Streamlit frontend calls over HTTP instead of Django
 rendering the page itself. Run with:
 
-    uvicorn app.backend.main:app --reload --port 8000
+    uvicorn app.main:app --reload --port 8000
 
 (run from the project root so the `rag` and `retrieval` packages import
 correctly - same reason your Django app relied on being inside the project).
@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from rag.agent import agent_executor
+from rag.citations import extract_citations
 from rag.sql_store import ping as ping_sql_store
 from retrieval.vectorstore import build_or_load_vector_store
 
@@ -43,11 +44,26 @@ class QueryRequest(BaseModel):
     session_id: str = "default"
 
 
+class Citation(BaseModel):
+    """
+    One retrieved passage, as re-derived from the tool output itself
+    (rag/citations.py) rather than trusted from the model's own inline
+    [tag] formatting - see that module's docstring for why. "used" tells
+    the frontend whether the model actually cited this passage in its
+    final answer, vs. retrieved-but-not-used.
+    """
+    tag: str
+    source: str
+    doc_type: str
+    used: bool
+
+
 class QueryResponse(BaseModel):
     success: bool
     input: str
     output: str
     intermediate_steps: List[str] = []
+    citations: List[Citation] = []
     response_time: float
 
 
@@ -71,13 +87,21 @@ async def query_agent(request: QueryRequest):
         logger.info(f"Processing query: {text[:80]}...")
         result = await agent_executor.ainvoke({"input": text})
 
-        intermediate_steps = [str(step) for step in result.get("intermediate_steps", [])]
+        output = result.get("output", "No response generated")
+        raw_steps = result.get("intermediate_steps", [])
+        intermediate_steps = [str(step) for step in raw_steps]
+
+        # Ground-truth citation list built from what retrieve_documents
+        # actually returned this turn, not just the [tag]s the model
+        # happened to type correctly - see rag/citations.py.
+        citations = extract_citations(raw_steps, output)
 
         return QueryResponse(
             success=True,
             input=text,
-            output=result.get("output", "No response generated"),
+            output=output,
             intermediate_steps=intermediate_steps,
+            citations=citations,
             response_time=round(time.time() - start_time, 2),
         )
     except Exception as e:

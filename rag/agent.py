@@ -13,6 +13,13 @@ when nothing relevant came back. This is what satisfies the mandatory
 """
 import os
 from dotenv import load_dotenv
+
+# MUST run before any project import (rag.tools -> retrieval.vectorstore ->
+# rag.db reads DATABASE_URL/SUPABASE_DB_URL from os.environ at import
+# time). Calling load_dotenv() after `from rag.tools import TOOLS` means
+# .env hasn't been loaded yet when rag/db.py goes looking for it.
+load_dotenv()
+
 from langchain_classic.agents import (
     AgentExecutor,
     create_tool_calling_agent,
@@ -21,8 +28,6 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from rag.tools import TOOLS
-
-load_dotenv()
 
 
 AGENT_MODEL = os.getenv("AGENT_MODEL", "gpt-4o-mini")
@@ -50,8 +55,14 @@ RULES (follow these exactly):
   with ORDER BY ... LIMIT 1 (or GROUP BY + aggregate) so the database computes the answer -
   never fetch a list of rows and try to eyeball or re-rank the extreme yourself. That kind of
   manual comparison across many rows is exactly where mistakes happen.
-- Always cite your source for every factual claim: name the document (for retrieve_documents)
-  or say "from the client database" (for query_client_database).
+- CITATIONS: every passage retrieve_documents returns starts with a bracketed tag, like
+  [suitability_policy.pdf#p2]. When a sentence in your answer draws on that passage, put that
+  EXACT tag immediately after the sentence, e.g.:
+    "Exotic structured products require a signed risk acknowledgement [suitability_policy.pdf#p2]."
+  Copy the tag character-for-character from the tool output - never renumber it, shorten it, or
+  invent one. If a sentence draws on more than one passage, put all the tags after it, e.g.
+  "...[fact_sheet.pdf#p1][suitability_policy.pdf#p2]". For query_client_database results, cite
+  as "from the client database" instead (there's no page/chunk tag for a SQL row).
 - If none of your tools return relevant information (a tool returns "NO_RESULTS", "ERROR", or
   what it returned doesn't actually address the question), you MUST respond exactly:
   "I don't have enough information in the available documents to answer that."
@@ -71,7 +82,10 @@ _agent = create_tool_calling_agent(llm=_llm, tools=TOOLS, prompt=_prompt)
 
 # return_intermediate_steps=True gives you the tool calls + outputs, which
 # is what you show in the "retrieval / tool trace" expander in Streamlit
-# and what satisfies the traceability bonus item almost for free.
+# and what rag/citations.py uses to build a reliable structured citations
+# list independent of whether the model's inline [tag] citations above are
+# perfectly formatted - the intermediate steps are ground truth for what
+# was actually retrieved.
 agent_executor = AgentExecutor(
     agent=_agent,
     tools=TOOLS,
