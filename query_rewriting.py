@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
@@ -8,42 +9,84 @@ from google import genai
 
 load_dotenv()
 
-# --- Supabase & Gemini Setup ---
+# --- Setup Clients ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY) must be set in .env")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY must be set in .env")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Load MiniLM model (384 dimensions - matching ingestion.py)
+# Load Embedding Model
 print("Loading MiniLM embedding model...")
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+try:
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+except Exception:
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def rewrite_query(original_query: str) -> list[str]:
-    """Uses Gemini to generate 3 alternative query variations."""
-    prompt = f"""You are an AI assistant specialized in optimizing search queries for vector databases.
-Generate 3 alternative versions of the user's query to capture different phrasings, synonyms, or related concepts.
+
+def call_gemini(prompt: str) -> str:
+    """Helper function to call Gemini with automatic fallback across models."""
+    models = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+    last_err = None
+    for model_name in models:
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Gemini API call failed: {last_err}")
+
+
+def rewrite_query_with_feedback(original_query: str, last_query: str = None, feedback: str = None) -> list[str]:
+    """Generates 3 targeted search query variations, taking into account past judge feedback if available."""
+    if feedback:
+        prompt = f"""You are an expert search optimizer for a vector retrieval system.
+The previous search attempt failed to retrieve sufficient context for the user's question.
+
+Original Question: {original_query}
+Previous Search Query Used: {last_query}
+Evaluator Feedback on Missing Details: {feedback}
+
+Generate 3 NEW, alternative search queries specifically targeted at addressing the missing details.
+Rules:
+- Focus on specific missing keywords, entities, or legal/financial policy codes.
+- Keep variations short, concise, and keyword-dense.
+- Output EXACTLY 3 lines, one query per line, without numbers, bullets, or commentary."""
+    else:
+        prompt = f"""You are an expert search optimizer for vector retrieval systems.
+Generate 3 alternative search queries for the user's input.
+Rules:
+- Keep variations short, concise, and focused on core keywords.
+- Preserve exact technical terms, acronyms, or proper nouns.
+- Output EXACTLY 3 lines, one query per line, without numbers, bullet points, or commentary.
 
 Original Query: {original_query}"""
 
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt,
-        )
-        lines = response.text.strip().split("\n")
+        raw_text = call_gemini(prompt)
+        lines = raw_text.strip().split("\n")
         rewrites = [line.strip().lstrip("0123456789.- ") for line in lines if line.strip()]
         return rewrites[:3]
     except Exception as e:
-        print(f"Warning: Failed to rewrite query with Gemini: {e}")
+        print(f"Warning: Query rewrite failed: {e}")
         return []
 
+
 def retrieve_chunks(query: str, top_k: int = 4) -> list[dict]:
-    """Retrieves top_k document chunks from Supabase for a single query string."""
+    """Retrieves top_k document chunks from Supabase vector storage."""
     query_vector = embedding_model.encode(query, show_progress_bar=False).tolist()
 
-    # Option A: Try Supabase RPC match_document_chunks if available
     try:
         rpc_res = supabase.rpc(
             "match_document_chunks",
@@ -56,9 +99,8 @@ def retrieve_chunks(query: str, top_k: int = 4) -> list[dict]:
         if rpc_res.data:
             return rpc_res.data
     except Exception:
-        pass  # Fall back to client-side vector search if RPC function does not exist
+        pass
 
-    # Option B: Client-side vector similarity fallback
     res = supabase.table("document_chunks").select("id, document_id, chunk_index, chunk_text, embedding").execute()
     if not res.data:
         return []
@@ -69,7 +111,6 @@ def retrieve_chunks(query: str, top_k: int = 4) -> list[dict]:
         emb = chunk.get("embedding")
         if emb:
             c_vec = np.array(emb if isinstance(emb, list) else json.loads(emb))
-            # Cosine similarity (MiniLM embeddings are L2 normalized)
             sim = float(np.dot(q_vec, c_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(c_vec) + 1e-10))
             chunk_copy = dict(chunk)
             chunk_copy["similarity"] = sim
@@ -79,29 +120,66 @@ def retrieve_chunks(query: str, top_k: int = 4) -> list[dict]:
     return scored_chunks[:top_k]
 
 
-def evaluate_accuracy_with_llm(user_query: str, retrieved_chunks: list[dict]) -> tuple[float, str]:
-    """Uses Gemini LLM-as-a-judge to grade how well retrieved chunks match user query intent (0-100%)."""
+def reciprocal_rank_fusion(query_results_list: list[list[dict]], top_k: int = 4, k: int = 60) -> list[dict]:
+    """Merges multiple vector search rank lists using Reciprocal Rank Fusion (RRF)."""
+    rrf_scores: dict[str, float] = {}
+    chunk_map: dict[str, dict] = {}
+
+    for chunk_list in query_results_list:
+        for rank, chunk in enumerate(chunk_list, start=1):
+            c_id = chunk["id"]
+            if c_id not in chunk_map:
+                chunk_map[c_id] = dict(chunk)
+            rrf_scores[c_id] = rrf_scores.get(c_id, 0.0) + (1.0 / (k + rank))
+
+    sorted_ids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
+    
+    fused_chunks = []
+    for cid in sorted_ids[:top_k]:
+        chunk = chunk_map[cid]
+        chunk["rrf_score"] = rrf_scores[cid]
+        fused_chunks.append(chunk)
+
+    return fused_chunks
+
+
+def generate_llm_answer(user_query: str, retrieved_chunks: list[dict]) -> str:
+    """Generates final answer using retrieved context."""
     if not retrieved_chunks:
-        return 0.0, "No chunks retrieved."
+        return "No relevant context retrieved to answer the query."
 
-    context = "\n\n".join([f"Chunk {idx+1}: {c['chunk_text']}" for idx, c in enumerate(retrieved_chunks)])
-    prompt = f"""You are an expert evaluator assessing the retrieval quality of a vector database RAG system.
+    context = "\n\n".join([f"[Chunk {idx+1}]: {c['chunk_text']}" for idx, c in enumerate(retrieved_chunks)])
+    prompt = f"""Answer the question based ONLY on the context below.
 
-User Query: "{user_query}"
+User Question: {user_query}
 
-Retrieved Context Chunks:
+Context Chunks:
 {context}
 
-Based on how relevant, comprehensive, and accurate these retrieved chunks are for answering the user's query, output a single score from 0 to 100 representing the retrieval accuracy/relevance percentage.
-Respond ONLY with a valid JSON object in this exact format:
-{{"score": 85, "reasoning": "Brief 1-sentence explanation"}}"""
+Answer:"""
 
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=prompt,
-        )
-        text = response.text.strip()
+        return call_gemini(prompt)
+    except Exception as e:
+        return f"Error generating answer: {e}"
+
+
+def evaluate_against_golden_truth(user_query: str, generated_answer: str, golden_truth: str) -> tuple[float, str]:
+    """Uses LLM-as-a-judge to compare generated RAG answer against golden truth ground truth."""
+    prompt = f"""You are an objective AI evaluator comparing a RAG system's generated output against a Ground Truth expected answer.
+
+User Query: "{user_query}"
+Expected Ground Truth Answer: "{golden_truth}"
+Generated RAG Output: "{generated_answer}"
+
+Evaluate the accuracy, completeness, and correctness of the Generated RAG Output against the Ground Truth Answer.
+Score the answer from 0 to 100.
+Respond ONLY with a valid JSON object in this format:
+{{"score": 90, "reasoning": "Brief explanation detailing specific missing facts or inaccuracies if any."}}"""
+
+    try:
+        raw_text = call_gemini(prompt)
+        text = raw_text.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -109,97 +187,126 @@ Respond ONLY with a valid JSON object in this exact format:
         data = json.loads(text.strip())
         return float(data.get("score", 0.0)), data.get("reasoning", "")
     except Exception as e:
-        mean_sim = np.mean([c.get("similarity", 0) for c in retrieved_chunks]) * 100
-        return round(float(mean_sim), 2), f"Calculated from average vector similarity ({mean_sim:.1f}%)"
+        return 0.0, f"Evaluation error: {e}"
 
 
-def run_comparison(user_query: str, top_k: int = 4):
-    print("\n" + "="*70)
-    print(f"  ORIGINAL QUERY: \"{user_query}\"")
-    print("="*70)
-
-    # 1. Query Rewriting
-    print("\n[Step 1] Rewriting query using Gemini (gemini-3.5-flash-lite)...")
-    rewritten_queries = rewrite_query(user_query)
-    print("  Alternative Queries Generated:")
-    for idx, q in enumerate(rewritten_queries, 1):
-        print(f"    {idx}. \"{q}\"")
-
-    # 2. Before Rewriting Retrieval
-    print("\n[Step 2] Retrieving documents BEFORE Query Rewriting (Original Query Only)...")
-    before_chunks = retrieve_chunks(user_query, top_k=top_k)
+def run_adaptive_rag_pipeline(query: str, golden_truth: str, target_score: float = 80.0, max_retries: int = 3, top_k: int = 4) -> dict:
+    """Executes an adaptive self-correcting RAG loop using LLM-as-a-Judge feedback."""
+    last_feedback = None
+    last_query_used = query
     
-    print(f"\n  --- BEFORE REWRITING RESULTS (Top {len(before_chunks)}) ---")
-    for idx, c in enumerate(before_chunks, 1):
-        sim = c.get("similarity", 0)
-        snippet = c["chunk_text"].replace("\n", " ")[:120]
-        print(f"  [{idx}] (Similarity: {sim:.4f}) | Chunk #{c.get('chunk_index', '?')}")
-        print(f"      \"{snippet}...\"")
+    best_attempt = {
+        "score": -1.0,
+        "answer": "",
+        "reasoning": "",
+        "chunks": [],
+        "attempts_taken": 0
+    }
 
-    # 3. After Rewriting Retrieval
-    print("\n[Step 3] Retrieving documents AFTER Query Rewriting (Original + 3 Variations)...")
-    all_queries = [user_query] + rewritten_queries
-    after_chunk_dict = {}
+    for attempt in range(1, max_retries + 1):
+        print(f"\n  [Loop Attempt {attempt}/{max_retries}] Rewrite & Retrieval Phase...")
+        
+        # 1. Generate query variations based on feedback
+        rewritten_queries = rewrite_query_with_feedback(query, last_query=last_query_used, feedback=last_feedback)
+        search_queries = [query] + rewritten_queries
+        print(f"    Queries Used: {search_queries}")
 
-    for q in all_queries:
-        chunks = retrieve_chunks(q, top_k=top_k)
-        for c in chunks:
-            c_id = c["id"]
-            if c_id not in after_chunk_dict or c.get("similarity", 0) > after_chunk_dict[c_id].get("similarity", 0):
-                after_chunk_dict[c_id] = c
+        # 2. Retrieve chunks across all queries and fuse with RRF
+        all_chunk_lists = [retrieve_chunks(q, top_k=top_k) for q in search_queries]
+        retrieved_chunks = reciprocal_rank_fusion(all_chunk_lists, top_k=top_k)
 
-    # Sort combined retrieved chunks by similarity score
-    after_chunks = sorted(after_chunk_dict.values(), key=lambda x: x.get("similarity", 0), reverse=True)[:top_k]
+        # 3. Generate Answer
+        generated_answer = generate_llm_answer(query, retrieved_chunks)
 
-    print(f"\n  --- AFTER REWRITING RESULTS (Top {len(after_chunks)}) ---")
-    for idx, c in enumerate(after_chunks, 1):
-        sim = c.get("similarity", 0)
-        snippet = c["chunk_text"].replace("\n", " ")[:120]
-        print(f"  [{idx}] (Similarity: {sim:.4f}) | Chunk #{c.get('chunk_index', '?')}")
-        print(f"      \"{snippet}...\"")
+        # 4. Evaluate with LLM-as-a-Judge against Golden Truth
+        score, reasoning = evaluate_against_golden_truth(query, generated_answer, golden_truth)
+        print(f"    Judge Score: {score:.1f}% | Feedback: {reasoning}")
 
-    # 4. Accuracy & Relevance Evaluation
-    print("\n[Step 4] Evaluating Retrieval Accuracy with LLM-as-a-Judge...")
-    before_score, before_reason = evaluate_accuracy_with_llm(user_query, before_chunks)
-    after_score, after_reason = evaluate_accuracy_with_llm(user_query, after_chunks)
+        # Track best score across attempts
+        if score > best_attempt["score"]:
+            best_attempt = {
+                "score": score,
+                "answer": generated_answer,
+                "reasoning": reasoning,
+                "chunks": retrieved_chunks,
+                "attempts_taken": attempt
+            }
 
-    print("\n" + "="*70)
-    print("                      ACCURACY & RETRIEVAL COMPARISON SUMMARY")
-    print("="*70)
-    print(f"  BEFORE REWRITING ACCURACY : {before_score:.1f}%")
-    print(f"    Reasoning: {before_reason}")
-    print(f"  AFTER REWRITING ACCURACY  : {after_score:.1f}%")
-    print(f"    Reasoning: {after_reason}")
-
-    diff = after_score - before_score
-    if diff > 0:
-        print(f"\n  -> Query Rewriting IMPROVED retrieval accuracy by +{diff:.1f}%! 🚀")
-    elif diff < 0:
-        print(f"\n  -> Query Rewriting decreased accuracy by {diff:.1f}%.")
-    else:
-        print(f"\n  -> Retrieval accuracy remained identical ({before_score:.1f}%).")
-    print("="*70 + "\n")
-
-
-def main():
-    print("="*70)
-    print("  Supabase Vector DB Query Rewriting Test Harness")
-    print("="*70)
-
-    while True:
-        try:
-            user_prompt = input("\nEnter prompt to test (or 'exit' to quit): ").strip()
-            if not user_prompt:
-                continue
-            if user_prompt.lower() in ("exit", "quit", "q"):
-                print("Exiting test harness. Goodbye!")
-                break
-            
-            run_comparison(user_prompt)
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting.")
+        # Threshold Exit Condition
+        if score >= target_score:
+            print(f"  -> Target score reached ({score:.1f}% >= {target_score:.1f}%)! Ending loop.")
             break
+        else:
+            print(f"  -> Score below target threshold ({target_score:.1f}%). Retrying with feedback...")
+            last_feedback = reasoning
+            last_query_used = search_queries[1] if len(search_queries) > 1 else query
+
+    return best_attempt
+
+
+def evaluate_dataset(excel_path: str = "datasets/golden_dataset_for_RAG_evaluation.xlsx", top_k: int = 4, target_score: float = 80.0, max_retries: int = 3):
+    """Loads Golden Dataset Excel file and runs full adaptive evaluation comparison."""
+    print("Loading Golden Dataset Excel sheet...")
+    df = pd.read_excel(excel_path, sheet_name="Golden Dataset")
+    
+    valid_rows = df.dropna(subset=["Sample query", "Expected answer"])
+    results = []
+    
+    for idx, row in valid_rows.iterrows():
+        sn = row.get("S/N", idx)
+        topic = row.get("Topic of the query", "General")
+        query = row.get("Sample query")
+        golden_truth = row.get("Expected answer")
+
+        if str(sn).upper() == "EX":
+            continue
+
+        print("\n" + "="*80)
+        print(f"  [Item {sn}] Topic: {topic}")
+        print(f"  Query: \"{query}\"")
+        print("="*80)
+
+        # Baseline: Single-pass Original Query Only
+        print("\n--- BASELINE (Single Query, No Rewriting Loop) ---")
+        base_chunks = retrieve_chunks(query, top_k=top_k)
+        base_answer = generate_llm_answer(query, base_chunks)
+        base_score, base_reason = evaluate_against_golden_truth(query, base_answer, golden_truth)
+        print(f"  Baseline Score: {base_score:.1f}% | Reasoning: {base_reason}")
+
+        # Adaptive Loop with LLM Feedback
+        print("\n--- ADAPTIVE FEEDBACK LOOP (Self-Correcting RAG) ---")
+        best_run = run_adaptive_rag_pipeline(
+            query=query, 
+            golden_truth=golden_truth, 
+            target_score=target_score, 
+            max_retries=max_retries, 
+            top_k=top_k
+        )
+
+        results.append({
+            "S/N": sn,
+            "Topic": topic,
+            "Query": query,
+            "Golden Truth": golden_truth,
+            "Baseline_Score": base_score,
+            "Baseline_Reasoning": base_reason,
+            "Adaptive_Score": best_run["score"],
+            "Adaptive_Reasoning": best_run["reasoning"],
+            "Attempts_Required": best_run["attempts_taken"],
+            "Score_Delta": best_run["score"] - base_score
+        })
+
+    # Summary Output
+    res_df = pd.DataFrame(results)
+    print("\n" + "="*80)
+    print("                        OVERALL EVALUATION SUMMARY")
+    print("="*80)
+    print(f"Average Baseline Score             : {res_df['Baseline_Score'].mean():.2f}%")
+    print(f"Average Adaptive Loop Score         : {res_df['Adaptive_Score'].mean():.2f}%")
+    print(f"Average Score Improvement           : {res_df['Score_Delta'].mean():+.2f}%")
+    print(f"Average Attempts Needed per Query   : {res_df['Attempts_Required'].mean():.2f}")
+    print("="*80)
 
 
 if __name__ == "__main__":
-    main()
+    evaluate_dataset()
