@@ -1,165 +1,126 @@
-"""
-Extract text from the PDFs and the correspondence emails, chunk it,
-embed it, and load it into document_chunks.
-
-Client IDs (CL001, CL013, etc) are detected in the text with a simple
-regex and stored in documents.metadata->related_clients. This is what
-lets the agent later filter vector search to "documents that mention
-this client" for the multi-hop questions, without needing manual
-tagging of which document belongs to which client.
-
-Run with: python -m ingestion.parse_documents
-"""
-
-import json
-import re
+import os
+from dotenv import load_dotenv
 from pathlib import Path
-
-from pypdf import PdfReader
+from docling.document_converter import DocumentConverter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+from supabase import create_client, Client
 
-from db.connection import run_write, run_write_many, run_query
+load_dotenv()  # Load environment variables from .env file
 
-DATA_DIR = Path("data")
-CLIENT_ID_PATTERN = re.compile(r"\bCL\d{3}\b")
+# --- Supabase Configuration ---
+load_dotenv()  # Load environment variables from .env file
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- MiniLM Embedding Model Setup ---
+# all-MiniLM-L6-v2 outputs 384-dimensional vectors
+print("Loading MiniLM embedding model...")
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def load_client_name_map() -> dict[str, str]:
-    """Maps client name -> client_id, so documents that mention a
-    client by name (most correspondence does) still get tagged.
-    Requires parse_structured.py to have run first.
-    """
-    rows = run_query("select client_id, name from clients where name is not null")
-    return {row["name"]: row["client_id"] for row in rows}
+# --- Chunking Setup ---
+headers_to_split_on = [
+    ("#", "Header 1"),
+    ("##", "Header 2"),
+    ("###", "Header 3"),
+]
+markdown_splitter = MarkdownHeaderTextSplitter(
+    headers_to_split_on=headers_to_split_on, 
+    strip_headers=False
+)
 
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500, 
+    chunk_overlap=150
+)
 
-def find_related_clients(text: str, client_names: dict[str, str]) -> list[str]:
-    found = set(CLIENT_ID_PATTERN.findall(text))
-    lowered = text.lower()
-    for name, client_id in client_names.items():
-        if name.lower() in lowered:
-            found.add(client_id)
-    return sorted(found)
+def chunk_markdown_text(markdown_text: str) -> list[str]:
+    """Splits Markdown into context-sized text blocks."""
+    header_splits = markdown_splitter.split_text(markdown_text)
+    
+    final_chunks = []
+    for doc in header_splits:
+        sub_chunks = text_splitter.split_text(doc.page_content)
+        final_chunks.extend(sub_chunks)
+        
+    return final_chunks
 
+def convert_and_ingest_to_supabase(input_dir: str, output_dir: str):
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
-    words = text.split()
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        if chunk.strip():
-            chunks.append(chunk)
-        start = end - overlap
-    return chunks
+    pdf_files = list(input_path.glob("**/*.pdf"))
 
-
-def insert_document(doc_type: str, title: str, source_path: str, text: str, client_names: dict[str, str], extra_metadata: dict | None = None):
-    related_clients = find_related_clients(text, client_names)
-    metadata = {"related_clients": related_clients, **(extra_metadata or {})}
-
-    rows = run_write_and_return_id(
-        """
-        insert into documents (doc_type, title, source_path, metadata)
-        values (%s, %s, %s, %s)
-        returning id
-        """,
-        (doc_type, title, source_path, json.dumps(metadata)),
-    )
-    document_id = rows[0]["id"]
-
-    chunks = chunk_text(text)
-    if not chunks:
+    if not pdf_files:
+        print(f"No PDF files found in '{input_dir}'")
         return
-    embeddings = model.encode(chunks, normalize_embeddings=True)
 
-    chunk_rows = [
-        (document_id, i, chunk, embedding.tolist())
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-    ]
-    run_write_many(
-        """
-        insert into document_chunks (document_id, chunk_index, chunk_text, embedding)
-        values (%s, %s, %s, %s)
-        """,
-        chunk_rows,
-    )
-    print(f"  {title}: {len(chunks)} chunks, related clients: {related_clients or 'none detected'}")
+    print(f"Found {len(pdf_files)} PDF(s) to convert, embed, and upload...\n")
+    converter = DocumentConverter()
 
+    for idx, pdf_file in enumerate(pdf_files, 1):
+        print(f"[{idx}/{len(pdf_files)}] Converting: {pdf_file.name} ...")
 
-def run_write_and_return_id(sql: str, params: tuple) -> list[dict]:
-    """insert ... returning id needs its own helper since run_write doesn't fetch."""
-    from db.connection import get_connection
-    import psycopg2.extras
+        try:
+            # 1. Parse PDF with Docling
+            result = converter.convert(str(pdf_file))
+            markdown_content = result.document.export_to_markdown()
 
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params)
-            result = [dict(row) for row in cur.fetchall()]
-        conn.commit()
-    return result
+            # Save Markdown file locally
+            output_file_name = pdf_file.stem + ".md"
+            output_file_path = output_path / output_file_name
+            with open(output_file_path, "w", encoding="utf-8") as f:
+                f.write(markdown_content)
 
+            # 2. Insert document record into `documents` table first
+            doc_type = "factsheet" if "factsheet" in pdf_file.name else ("policy" if "policy" in pdf_file.name else "document")
+            doc_res = supabase.table("documents").insert({
+                "title": pdf_file.stem,
+                "doc_type": doc_type,
+                "source_path": pdf_file.name,
+                "metadata": {}
+            }).execute()
 
-def ingest_pdf(path: Path, doc_type: str, client_names: dict[str, str]):
-    reader = PdfReader(path)
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    insert_document(doc_type=doc_type, title=path.stem, source_path=path.name, text=text, client_names=client_names)
+            # Retrieve the created document's ID
+            document_id = doc_res.data[0]["id"]
+            print(f" Created document record (ID: {document_id})")
 
+            # 3. Chunk the Markdown content
+            chunks = chunk_markdown_text(markdown_content)
+            print(f" Created {len(chunks)} chunks.")
 
-def ingest_email_threads(path: Path, client_names: dict[str, str]):
-    with open(path) as f:
-        threads = json.load(f)
+            if not chunks:
+                continue
 
-    for thread in threads:
-        # TODO confirm these keys against the real client_correspondence.json
-        subject = thread.get("subject", "untitled thread")
-        messages = thread.get("messages", [])
-        combined_text = "\n\n".join(
-            f"From: {m.get('from')}\nDate: {m.get('date')}\n{m.get('body', m.get('text', ''))}"
-            for m in messages
-        )
-        insert_document(
-            doc_type="email",
-            title=subject,
-            source_path=f"client_correspondence.json#{subject}",
-            text=combined_text,
-            client_names=client_names,
-            extra_metadata={"thread_type": thread.get("type")},
-        )
+            # 4. Generate Embeddings
+            print(" -> Generating MiniLM embeddings...")
+            embeddings = embedding_model.encode(chunks, show_progress_bar=False)
 
+            # 5. Prepare payload matching `document_chunks` table (including document_id)
+            records_to_insert = [
+                {
+                    "document_id": document_id,  # Link chunk to parent document
+                    "chunk_index": chunk_idx,
+                    "chunk_text": chunk_text,
+                    "embedding": embedding.tolist()
+                }
+                for chunk_idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings))
+            ]
+
+            # 6. Upload chunks to Supabase
+            supabase.table("document_chunks").insert(records_to_insert).execute()
+            print(f" -> Successfully uploaded chunks and vectors to Supabase!\n")
+
+        except Exception as e:
+            print(f" -> Error processing {pdf_file.name}: {e}\n")
+
+    print("All conversions, embeddings, and Supabase uploads complete!")
 
 if __name__ == "__main__":
-    pdf_files = {
-        "policy_kyc_onboarding.pdf": "policy",
-        "policy_investment_suitability.pdf": "policy",
-        "fund_factsheet_safe.pdf": "factsheet",
-        "fund_factsheet_global_bond_income.pdf": "factsheet",
-        "fund_factsheet_global_reit_basket.pdf": "factsheet",
-        "fund_factsheet_balanced_income_growth.pdf": "factsheet",
-        "fund_factsheet_pacific_growth_equity.pdf": "factsheet",
-        "fund_factsheet_ilp_regular_premium.pdf": "factsheet",
-        "fund_factsheet_global_tech_innovation.pdf": "factsheet",
-        "fund_factsheet_dci_aud_usd.pdf": "factsheet",
-        "fund_factsheet_private_equity_fund_iv.pdf": "factsheet",
-        "fund_factsheet_exotic_unsafe.pdf": "factsheet",
-        "rm_call_notes_log.pdf": "call_note",
-        "client_complaint_letters.pdf": "complaint",
-        "complex_product_risk_acknowledgement_forms.pdf": "form",
-    }
+    INPUT_PDF_DIR = "datasets"
+    OUTPUT_MD_DIR = "dataset_chunked"
 
-    client_names = load_client_name_map()
-    print(f"Loaded {len(client_names)} client names for tagging")
-
-    print("Ingesting PDFs...")
-    for filename, doc_type in pdf_files.items():
-        path = DATA_DIR / filename
-        if path.exists():
-            ingest_pdf(path, doc_type, client_names)
-        else:
-            print(f"  skipped {filename}, not found in {DATA_DIR}")
-
-    print("Ingesting email threads...")
-    ingest_email_threads(DATA_DIR / "client_correspondence.json", client_names)
+    convert_and_ingest_to_supabase(INPUT_PDF_DIR, OUTPUT_MD_DIR)
