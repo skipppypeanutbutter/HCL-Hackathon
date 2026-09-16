@@ -5,9 +5,10 @@ langchain-openai
 langchain-community
 langchain-core
 langchain-classic
-langchain-huggingface
-faiss-cpu
 sentence-transformers
+langchain-huggingface
+psycopg2-binary
+pgvector
 pandas
 python-dotenv
 streamlit

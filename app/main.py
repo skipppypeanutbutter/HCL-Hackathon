@@ -20,7 +20,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from rag.agent import agent_executor
-# from retrieval.vectorstore import build_or_load_vector_store
+from rag.sql_store import ping as ping_sql_store
+from retrieval.vectorstore import build_or_load_vector_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,14 +88,25 @@ async def query_agent(request: QueryRequest):
         )
 
 
-# @app.get("/api/health")
-# def health_check():
-#     """Equivalent to your Django health_check view."""
-#     status = {"status": "healthy", "fastapi": "running", "agent": "initialized"}
-#     try:
-#         build_or_load_vector_store()
-#         status["vector_store"] = "connected"
-#     except Exception as e:
-#         status["vector_store"] = f"error: {e}"
-#         status["status"] = "unhealthy"
-#     return status
+@app.get("/api/health")
+def health_check():
+    """Equivalent to your Django health_check view."""
+    status = {"status": "healthy", "fastapi": "running", "agent": "initialized"}
+    try:
+        chunk_count = build_or_load_vector_store()
+        status["vector_store"] = f"connected ({chunk_count} chunks)"
+    except Exception as e:
+        # most common causes: DATABASE_URL unset/wrong, or the Supabase
+        # project's IPv6-only "direct connection" string was used instead
+        # of the IPv4-friendly "session pooler" one
+        status["vector_store"] = f"error: {e}"
+        status["status"] = "unhealthy"
+
+    try:
+        client_count = ping_sql_store()
+        status["sql_store"] = f"connected ({client_count} clients)"
+    except Exception as e:
+        status["sql_store"] = f"error: {e}"
+        status["status"] = "unhealthy"
+
+    return status
